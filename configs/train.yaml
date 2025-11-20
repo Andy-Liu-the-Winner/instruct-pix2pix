@@ -6,6 +6,9 @@ model:
   target: ldm.models.diffusion.ddpm_edit.LatentDiffusion
   params:
     ckpt_path: stable_diffusion/models/ldm/stable-diffusion-v1/v1-5-pruned-emaonly.ckpt
+    lora_rank: 4           # LoRA rank (set to 0 to disable LoRA)
+    lora_alpha: 1.0        # LoRA scaling factor
+    lora_dropout: 0.0      # LoRA dropout rate
     linear_start: 0.00085
     linear_end: 0.0120
     num_timesteps_cond: 1
@@ -45,7 +48,7 @@ model:
         use_spatial_transformer: True
         transformer_depth: 1
         context_dim: 768
-        use_checkpoint: True
+        use_checkpoint: False
         legacy: False
 
     first_stage_config:
@@ -80,22 +83,22 @@ data:
     batch_size: 32
     num_workers: 2
     train:
-      target: edit_dataset.EditDataset
+      target: hf_edit_dataset.HFEditDataset
       params:
-        path: data/clip-filtered-dataset
+        hf_dataset_name: UCSC-VLAA/HQ-Edit
         split: train
         min_resize_res: 256
         max_resize_res: 256
         crop_res: 256
         flip_prob: 0.5
-    validation:
-      target: edit_dataset.EditDataset
-      params:
-        path: data/clip-filtered-dataset
-        split: val
-        min_resize_res: 256
-        max_resize_res: 256
-        crop_res: 256
+    # validation:
+    #   target: hf_edit_dataset.HFEditDataset
+    #   params:
+    #     hf_dataset_name: UCSC-VLAA/HQ-Edit
+    #     split: val
+    #     min_resize_res: 256
+    #     max_resize_res: 256
+    #     crop_res: 256
 
 lightning:
   callbacks:
@@ -107,7 +110,7 @@ lightning:
         increase_log_steps: False
 
   trainer:
-    max_epochs: 2000
+    max_epochs: 20
     benchmark: True
     accumulate_grad_batches: 4
     check_val_every_n_epoch: 4
