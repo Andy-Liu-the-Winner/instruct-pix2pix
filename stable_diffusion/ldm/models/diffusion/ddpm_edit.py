@@ -28,6 +28,12 @@ from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, Autoenc
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
 
+import sys
+import os
+# Make Python look 3 folders above this file so imports work for loraunet
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
+from lora_unet import apply_lora_to_unet
+
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -473,7 +479,14 @@ class LatentDiffusion(DDPM):
             conditioning_key = None
         ckpt_path = kwargs.pop("ckpt_path", None)
         ignore_keys = kwargs.pop("ignore_keys", [])
+        lora_rank = kwargs.pop("lora_rank", 0)
+        lora_alpha = kwargs.pop("lora_alpha", 1.0)
+        lora_dropout = kwargs.pop("lora_dropout", 0.0)
         super().__init__(conditioning_key=conditioning_key, *args, load_ema=load_ema, **kwargs)
+        # Store LoRA config for optimizer
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
         self.cond_stage_key = cond_stage_key
@@ -495,6 +508,16 @@ class LatentDiffusion(DDPM):
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys)
             self.restarted_from_ckpt = True
+
+            if lora_rank > 0:
+                print(f"Applying LoRA to UNet: rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}")
+                apply_lora_to_unet(
+                    self.model.diffusion_model,
+                    rank=lora_rank,
+                    alpha=lora_alpha,
+                    dropout=lora_dropout
+                )
+                print("LoRA injection complete! Only LoRA parameters are trainable.")
 
             if self.use_ema and not load_ema:
                 self.model_ema = LitEma(self.model)
@@ -1040,7 +1063,7 @@ class LatentDiffusion(DDPM):
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
-        logvar_t = self.logvar[t].to(self.device)
+        logvar_t = self.logvar[t.cpu()].to(self.device)
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
         # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
@@ -1374,7 +1397,15 @@ class LatentDiffusion(DDPM):
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        params = list(self.model.parameters())
+
+        # Use only LoRA parameters if LoRA is enabled
+        if hasattr(self, 'lora_rank') and self.lora_rank > 0:
+            from lora_unet import get_lora_parameters
+            params = get_lora_parameters(self.model.diffusion_model)
+            print(f"Optimizer using {len(params)} LoRA parameters only")
+        else:
+            params = list(self.model.parameters())
+
         if self.cond_stage_trainable:
             print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
             params = params + list(self.cond_stage_model.parameters())
