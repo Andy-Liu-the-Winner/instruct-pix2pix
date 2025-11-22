@@ -119,20 +119,9 @@ class HFEditDataset(Dataset):
             else:
                 output_image = Image.fromarray(output_image).convert("RGB")
 
-        # Apply transformations (matching InstructPix2Pix preprocessing)
-        reize_res = np.random.randint(self.min_resize_res, self.max_resize_res + 1)
-        input_image = input_image.resize((reize_res, reize_res), Image.LANCZOS)
-        output_image = output_image.resize((reize_res, reize_res), Image.LANCZOS)
-
-        # Random crop
-        if reize_res > self.crop_res:
-            input_image = self._random_crop(input_image, self.crop_res)
-            output_image = self._random_crop(output_image, self.crop_res)
-
-        # Random horizontal flip
-        if np.random.rand() < self.flip_prob:
-            input_image = input_image.transpose(Image.FLIP_LEFT_RIGHT)
-            output_image = output_image.transpose(Image.FLIP_LEFT_RIGHT)
+        # Resize to target resolution (no random crop or flip - cleaner for spatial learning)
+        input_image = input_image.resize((self.crop_res, self.crop_res), Image.LANCZOS)
+        output_image = output_image.resize((self.crop_res, self.crop_res), Image.LANCZOS)
 
         # Convert to numpy and normalize to [-1, 1]
         input_image = np.array(input_image).astype(np.float32) / 127.5 - 1.0
@@ -150,11 +139,3 @@ class HFEditDataset(Dataset):
             }
         }
 
-    def _random_crop(self, image, crop_res):
-        """Random crop to crop_res x crop_res"""
-        # If image is 256x256 and crop_res is 256, crop the full image
-        # If image is 300x300 and crop_res is 256, crop a random 256x256 region
-        width, height = image.size
-        left = np.random.randint(0, width - crop_res + 1)
-        top = np.random.randint(0, height - crop_res + 1)
-        return image.crop((left, top, left + crop_res, top + crop_res))
