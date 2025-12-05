@@ -16,8 +16,8 @@ def load_image(url):
     response = requests.get(url)
     return Image.open(BytesIO(response.content)).convert("RGB")
 
-def load_model(checkpoint_path):
-    config = OmegaConf.load("configs/train.yaml")
+def load_model(checkpoint_path, config_path="configs/train.yaml"):
+    config = OmegaConf.load(config_path)
     model = instantiate_from_config(config.model)
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -25,6 +25,11 @@ def load_model(checkpoint_path):
 
     model = model.cuda()
     model.eval()
+
+    # Print depth conditioning status
+    if hasattr(model, 'use_depth_conditioning'):
+        print(f"Depth conditioning: {model.use_depth_conditioning}")
+
     return model
 
 @torch.no_grad()
@@ -63,16 +68,29 @@ def edit_image(model, input_image, prompt, steps=100):
         image_tensor = 2 * torch.tensor(np.array(input_image)).float() / 255 - 1
         image_tensor = rearrange(image_tensor, "h w c -> 1 c h w").cuda()
 
+        image_latent = model.encode_first_stage(image_tensor).mode()
+
         cond = {
             "c_crossattn": [model.get_learned_conditioning([prompt])],
-            "c_concat": [model.encode_first_stage(image_tensor).mode()]
+            "c_concat": [image_latent]
         }
 
         null_token = model.get_learned_conditioning([""])
         uncond = {
             "c_crossattn": [null_token],
-            "c_concat": [torch.zeros_like(cond["c_concat"][0])]
+            "c_concat": [torch.zeros_like(image_latent)]
         }
+
+        # Add depth conditioning if enabled
+        if hasattr(model, 'use_depth_conditioning') and model.use_depth_conditioning:
+            if model.depth_conditioner is not None:
+                print("  Adding depth conditioning...")
+                depth_3ch = model.depth_conditioner.get_depth(image_tensor)
+                if depth_3ch is not None:
+                    depth_3ch = depth_3ch.cuda()
+                    depth_latent = model.encode_first_stage(depth_3ch).mode()
+                    cond["c_concat"].append(depth_latent)
+                    uncond["c_concat"].append(torch.zeros_like(depth_latent))
 
         model_wrap = K.external.CompVisDenoiser(model)
 
@@ -83,9 +101,14 @@ def edit_image(model, input_image, prompt, steps=100):
             def __call__(self, z, sigma, cond, uncond, text_cfg_scale, image_cfg_scale):
                 cfg_z = repeat(z, "1 ... -> n ...", n=3)
                 cfg_sigma = repeat(sigma, "1 ... -> n ...", n=3)
+
+                # Handle multiple c_concat elements (e.g., image + depth)
+                cond_concat = torch.cat(cond["c_concat"], dim=1)
+                uncond_concat = torch.cat(uncond["c_concat"], dim=1)
+
                 cfg_cond = {
                     "c_crossattn": [torch.cat([cond["c_crossattn"][0], uncond["c_crossattn"][0], uncond["c_crossattn"][0]])],
-                    "c_concat": [torch.cat([cond["c_concat"][0], cond["c_concat"][0], uncond["c_concat"][0]])],
+                    "c_concat": [torch.cat([cond_concat, cond_concat, uncond_concat])],
                 }
                 out_cond, out_img_cond, out_uncond = self.inner_model(cfg_z, cfg_sigma, cond=cfg_cond).chunk(3)
                 return out_uncond + text_cfg_scale * (out_cond - out_img_cond) + image_cfg_scale * (out_img_cond - out_uncond)
@@ -104,10 +127,11 @@ def edit_image(model, input_image, prompt, steps=100):
         return Image.fromarray(x.type(torch.uint8).cpu().numpy())
 
 if __name__ == "__main__":
-    # Load model
+    # Load model - SPATIAL FULL FINETUNE (no LoRA, 10 epochs)
     print("Loading model...")
-    checkpoint_path = "logs/train_spatial_spatial_lora_on_ip2p/checkpoints/last.ckpt"
-    model = load_model(checkpoint_path)
+    checkpoint_path = "logs/train_train_spatial_full_10ep/checkpoints/last.ckpt"
+    config_path = "configs/train.yaml"
+    model = load_model(checkpoint_path, config_path)
 
     # Extract experiment name from checkpoint path
     experiment_name = Path(checkpoint_path).parts[1]
@@ -120,13 +144,13 @@ if __name__ == "__main__":
     input_image = load_image(image_url)
     input_image.save(f"{output_dir}/{experiment_name}_input.png")
 
-    # Test prompts
+    # Test prompts - SPATIAL prompts to test depth conditioning
     prompts = [
-        "do not edit anything here",
+        "Put a hat on the cat's head",
+        "Add sunglasses on the cat's face",
+        "Place a ball in front of the cat",
+        "Add a bird flying behind the cat",
         "Turn this cat into a dog",
-        "Make a dog out of the cat",
-        "Turn the cat wear a hat, do not change the background",
-        "Turn the cat look like a lion, but it should still be a cat",
     ]
 
     # Generate
