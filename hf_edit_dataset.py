@@ -8,7 +8,7 @@
 #      input_image = before image (e.g., a cat photo)
 #      edit = text instruction (e.g., "turn this cat into a dog")
 #      output_image = after image (e.g., a dog photo)
-#   3. Applies data augmentation:
+#   3. Applies data augmentation (before midway report):
 #      Random resize
 #      Random crop
 #      Random horizontal flip
@@ -30,8 +30,10 @@
 import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 import io
+import os
+import glob
 
 
 class HFEditDataset(Dataset):
@@ -52,6 +54,7 @@ class HFEditDataset(Dataset):
         max_resize_res=256,
         crop_res=256,
         flip_prob=0.5,
+        saved_dataset_path=None,  # NEW: Load from saved filtered dataset
     ):
         self.split = split
         self.min_resize_res = min_resize_res
@@ -59,31 +62,54 @@ class HFEditDataset(Dataset):
         self.crop_res = crop_res
         self.flip_prob = flip_prob
 
-        print(f"Loading HuggingFace dataset from CACHE ONLY: {hf_dataset_name}, split: {split}")
+        # Load from saved filtered dataset (e.g., spatial_edits_hq_only)
+        if saved_dataset_path:
+            print(f"Loading from SAVED dataset: {saved_dataset_path}")
 
-        # Load directly from cached parquet files - NO DOWNLOADS!
-        import os
-        import glob
+            # Check if it's a sharded dataset (multiple shard_XXXX directories)
+            shard_pattern = os.path.join(saved_dataset_path, "shard_*")
+            shard_dirs = sorted(glob.glob(shard_pattern))
 
-        # Find all cached parquet files
-        parquet_pattern = os.path.expanduser("~/.cache/huggingface/hub/datasets--UCSC-VLAA--HQ-Edit/snapshots/*/data/*.parquet")
-        parquet_files = glob.glob(parquet_pattern)
+            if shard_dirs:
+                # Load and concatenate all shards
+                print(f"Found {len(shard_dirs)} shards, loading...")
+                from datasets import concatenate_datasets
+                datasets = []
+                skipped = []
+                for shard_dir in shard_dirs:
+                    try:
+                        ds = load_from_disk(shard_dir)
+                        datasets.append(ds)
+                        print(f"  Loaded {shard_dir}: {len(ds)} examples")
+                    except Exception as e:
+                        print(f"  SKIPPED {shard_dir} (corrupted): {e}")
+                        skipped.append(shard_dir)
+                if skipped:
+                    print(f"WARNING: {len(skipped)} shards corrupted, using {len(datasets)} shards")
+                self.dataset = concatenate_datasets(datasets)
+                print(f"Total: {len(self.dataset)} examples from {len(datasets)} shards")
+            else:
+                # Single dataset directory (old format)
+                self.dataset = load_from_disk(saved_dataset_path)
+                print(f"Loaded {len(self.dataset)} examples from saved dataset")
+        else:
+            # Otherwise, Load from parquet cache (original behavior)
+            print(f"Loading HuggingFace dataset from CACHE ONLY: {hf_dataset_name}, split: {split}")
 
-        if not parquet_files:
-            raise RuntimeError(f"No cached parquet files found at {parquet_pattern}")
+            parquet_pattern = os.path.expanduser("~/.cache/huggingface/hub/datasets--UCSC-VLAA--HQ-Edit/snapshots/*/data/*.parquet")
+            parquet_files = glob.glob(parquet_pattern)
 
-        print(f"Found {len(parquet_files)} cached parquet files")
+            if not parquet_files:
+                raise RuntimeError(f"No cached parquet files found at {parquet_pattern}")
 
-        # TEST MODE: Use only first 5 files for quick testing (~2000-3000 examples)
-        # Comment out this line to use all files
-        # parquet_files = parquet_files[:5] experiment 1
-        parquet_files = parquet_files[:100]
-        print(f"TEST MODE: Using only {len(parquet_files)} files for quick validation")
+            print(f"Found {len(parquet_files)} cached parquet files")
 
-        # Load directly from parquet files - NO INTERNET ACCESS
-        self.dataset = load_dataset("parquet", data_files=parquet_files, split=split)
+            # TEST MODE: Use only first 100 files
+            parquet_files = parquet_files[:100]
+            print(f"TEST MODE: Using only {len(parquet_files)} files for quick validation")
 
-        print(f"Loaded {len(self.dataset)} examples from LOCAL CACHE - NO DOWNLOADS!")
+            self.dataset = load_dataset("parquet", data_files=parquet_files, split=split)
+            print(f"Loaded {len(self.dataset)} examples from LOCAL CACHE - NO DOWNLOADS!")
 
         # Print first example to understand structure
         if len(self.dataset) > 0:

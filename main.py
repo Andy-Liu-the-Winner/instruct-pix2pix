@@ -26,6 +26,15 @@ sys.path.append("./stable_diffusion")
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
 
+# Lazy import - only load if intrinsic_lora is actually used
+apply_intrinsic_lora = None
+def _get_apply_intrinsic_lora():
+    global apply_intrinsic_lora
+    if apply_intrinsic_lora is None:
+        from intrinsic_lora import apply_intrinsic_lora as _apply
+        apply_intrinsic_lora = _apply
+    return apply_intrinsic_lora
+
 
 def get_parser(**parser_kwargs):
     def str2bool(v):
@@ -123,6 +132,32 @@ def get_parser(**parser_kwargs):
         action="store_true",
         default=False,
         help="scale base-lr by ngpu * batch_size * n_accumulate",
+    )
+    parser.add_argument(
+        "--use_intrinsic_lora",
+        type=str2bool,
+        const=True,
+        default=False,
+        nargs="?",
+        help="If true and the model exposes diffusers-style attention processors, inject intrinsic LoRA adapters.",
+    )
+    parser.add_argument(
+        "--intrinsic_lora_rank",
+        type=int,
+        default=4,
+        help="Rank for intrinsic LoRA adapters.",
+    )
+    parser.add_argument(
+        "--intrinsic_lora_alpha",
+        type=float,
+        default=None,
+        help="Scaling (alpha) for intrinsic LoRA adapters. Defaults to rank if None.",
+    )
+    parser.add_argument(
+        "--intrinsic_lora_types",
+        type=str,
+        default="depth,normals,albedo,shading",
+        help="Comma-separated intrinsic heads to allocate adapters for.",
     )
     return parser
 
@@ -544,6 +579,35 @@ if __name__ == "__main__":
 
     opt, unknown = parser.parse_known_args()
 
+    def _maybe_apply_intrinsic_lora(model_obj):
+        if not getattr(opt, "use_intrinsic_lora", False):
+            return None
+        intrinsic_types = [t for t in opt.intrinsic_lora_types.split(",") if t]
+        # Try to find a diffusers-style UNet that exposes attention processors.
+        candidate_unets = [
+            getattr(model_obj, "unet", None),
+            getattr(getattr(model_obj, "model", None), "unet", None),
+            getattr(getattr(model_obj, "model", None), "diffusion_model", None),
+        ]
+        unet = next((u for u in candidate_unets if u is not None), None)
+        if unet is None or not hasattr(unet, "set_attn_processor"):
+            rank_zero_info("Intrinsic LoRA requested, but no diffusers-style UNet with set_attn_processor found.")
+            return None
+        _apply_fn = _get_apply_intrinsic_lora()
+        manager = _apply_fn(
+            unet,
+            rank=opt.intrinsic_lora_rank,
+            intrinsic_types=intrinsic_types,
+            lora_alpha=opt.intrinsic_lora_alpha,
+        )
+        rank_zero_info(
+            f"Applied intrinsic LoRA to UNet with rank={opt.intrinsic_lora_rank}, "
+            f"alpha={opt.intrinsic_lora_alpha}, types={intrinsic_types}."
+        )
+        # Attach for downstream access (e.g., choose task or gather params).
+        setattr(model_obj, "intrinsic_lora_manager", manager)
+        return manager
+
     assert opt.name
     cfg_fname = os.path.split(opt.base[0])[-1]
     cfg_name = os.path.splitext(cfg_fname)[0]
@@ -597,6 +661,7 @@ if __name__ == "__main__":
 
         # model
         model = instantiate_from_config(config.model)
+        _maybe_apply_intrinsic_lora(model)
 
         # trainer and callbacks
         trainer_kwargs = dict()

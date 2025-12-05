@@ -30,9 +30,13 @@ from ldm.models.diffusion.ddim import DDIMSampler
 
 import sys
 import os
-# Make Python look 3 folders above this file so imports work for loraunet
+# Make Python look 3 folders above this file so imports work for lora module
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
-from lora_unet import apply_lora_to_unet
+# Import both legacy and new modular LoRA system
+from lora_unet import apply_lora_to_unet, get_lora_parameters
+from lora import LoRACombiner, get_lora, list_loras
+# Import depth conditioning for spatial reasoning
+from depth_estimator import DepthConditioner
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -479,14 +483,26 @@ class LatentDiffusion(DDPM):
             conditioning_key = None
         ckpt_path = kwargs.pop("ckpt_path", None)
         ignore_keys = kwargs.pop("ignore_keys", [])
+        # Legacy LoRA params (backward compatible)
         lora_rank = kwargs.pop("lora_rank", 0)
         lora_alpha = kwargs.pop("lora_alpha", 1.0)
         lora_dropout = kwargs.pop("lora_dropout", 0.0)
+        # New modular LoRA config (list of dicts)
+        lora_config = kwargs.pop("lora_config", None)
+        # Depth conditioning for spatial reasoning (optional)
+        use_depth_conditioning = kwargs.pop("use_depth_conditioning", False)
+        depth_model_type = kwargs.pop("depth_model_type", "midas")
         super().__init__(conditioning_key=conditioning_key, *args, load_ema=load_ema, **kwargs)
         # Store LoRA config for optimizer
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
+        self.lora_config = lora_config
+        self.lora_combiner = None  # Will be set if using modular LoRA
+        # Store depth conditioning config
+        self.use_depth_conditioning = use_depth_conditioning
+        # Note: depth_conditioner is stored as _depth_conditioner_impl to avoid DDP tracking
+        # Access via self.depth_conditioner property
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
         self.cond_stage_key = cond_stage_key
@@ -509,19 +525,123 @@ class LatentDiffusion(DDPM):
             self.init_from_ckpt(ckpt_path, ignore_keys)
             self.restarted_from_ckpt = True
 
-            if lora_rank > 0:
-                print(f"Applying LoRA to UNet: rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}")
+            # Apply LoRA - supports both legacy and new modular system
+            if lora_config is not None:
+                # New modular LoRA system - supports multiple LoRA types in parallel
+                print(f"[LoRA] Using modular LoRA system with {len(lora_config)} LoRA type(s)")
+                self.lora_combiner = LoRACombiner(lora_config)
+                self.lora_combiner.apply_all(self.model.diffusion_model)
+                print("[LoRA] Modular LoRA injection complete!")
+            elif lora_rank > 0:
+                # Legacy LoRA system (backward compatible)
+                print(f"[LoRA] Using legacy LoRA: rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}")
                 apply_lora_to_unet(
                     self.model.diffusion_model,
                     rank=lora_rank,
                     alpha=lora_alpha,
                     dropout=lora_dropout
                 )
-                print("LoRA injection complete! Only LoRA parameters are trainable.")
+                print("[LoRA] Legacy LoRA injection complete!")
+
+            # Initialize depth conditioning if enabled
+            if use_depth_conditioning:
+                print(f"[Depth] Initializing depth conditioner (model={depth_model_type})")
+                # Store as non-module attribute to avoid DDP tracking
+                depth_cond = DepthConditioner(
+                    depth_model_type=depth_model_type,
+                    enabled=True,
+                    device=self.device if hasattr(self, 'device') else "cuda",
+                )
+                # Freeze all depth conditioner params (inference only)
+                for param in depth_cond.parameters():
+                    param.requires_grad = False
+                # Register as buffer-like (not a submodule for DDP)
+                object.__setattr__(self, '_depth_conditioner_impl', depth_cond)
+                # Expand UNet input channels from 8 to 12 for depth conditioning
+                self._expand_unet_input_channels(additional_channels=4)
+                print("[Depth] Depth conditioning enabled - UNet expanded to 12 input channels")
 
             if self.use_ema and not load_ema:
                 self.model_ema = LitEma(self.model)
                 print(f"Keeping EMAs of {len(list(self.model_ema.buffers()))}.")
+
+    def _expand_unet_input_channels(self, additional_channels: int = 4):
+        # this part is only for testing based on depth conditioning
+        # no interesting results for now
+        """
+        Expand UNet input channels to accommodate depth conditioning.
+
+        The pre-trained UNet has 8 input channels (4 noise + 4 image latent).
+        This expands it to 12 channels (4 noise + 4 image + 4 depth).
+        New channels are initialized with zeros so the model starts from
+        the pre-trained state and learns to use depth gradually.
+        """
+        unet = self.model.diffusion_model
+
+        # Find the input conv layer (usually named 'input_blocks.0.0' or 'conv_in')
+        old_conv = None
+        conv_name = None
+
+        # Try common names for the first conv layer
+        if hasattr(unet, 'input_blocks'):
+            # OpenAI UNet style
+            old_conv = unet.input_blocks[0][0]
+            conv_name = "input_blocks[0][0]"
+        elif hasattr(unet, 'conv_in'):
+            # Diffusers style
+            old_conv = unet.conv_in
+            conv_name = "conv_in"
+
+        if old_conv is None:
+            print("[Depth] Warning: Could not find UNet input conv layer, skipping expansion")
+            return
+
+        old_in_channels = old_conv.in_channels
+        new_in_channels = old_in_channels + additional_channels
+
+        print(f"[Depth] Expanding {conv_name}: {old_in_channels} -> {new_in_channels} channels")
+
+        # Create new conv layer with more input channels
+        new_conv = nn.Conv2d(
+            in_channels=new_in_channels,
+            out_channels=old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=old_conv.bias is not None,
+        )
+
+        # Copy old weights and initialize new channels with zeros
+        with torch.no_grad():
+            # Copy existing weights for first 8 channels
+            new_conv.weight[:, :old_in_channels, :, :] = old_conv.weight
+            # Initialize new channels (depth) with zeros
+            new_conv.weight[:, old_in_channels:, :, :] = 0
+
+            if old_conv.bias is not None:
+                new_conv.bias = nn.Parameter(old_conv.bias.clone())
+
+        # Replace the conv layer
+        if hasattr(unet, 'input_blocks'):
+            unet.input_blocks[0][0] = new_conv
+        elif hasattr(unet, 'conv_in'):
+            unet.conv_in = new_conv
+
+        # Update the in_channels attribute
+        unet.in_channels = new_in_channels
+
+        # IMPORTANT: Unfreeze the new conv layer so depth channels can be learned
+        new_conv.weight.requires_grad = True
+        if new_conv.bias is not None:
+            new_conv.bias.requires_grad = True
+
+        print(f"[Depth] UNet input channels expanded successfully")
+        print(f"[Depth] Input conv layer unfrozen for training")
+
+    @property
+    def depth_conditioner(self):
+        """Access depth conditioner stored as non-module attribute to avoid DDP tracking."""
+        return getattr(self, '_depth_conditioner_impl', None)
 
     def make_cond_schedule(self, ):
         self.cond_ids = torch.full(size=(self.num_timesteps,), fill_value=self.num_timesteps - 1, dtype=torch.long)
@@ -729,6 +849,21 @@ class LatentDiffusion(DDPM):
         null_prompt = self.get_learned_conditioning([""])
         cond["c_crossattn"] = [torch.where(prompt_mask, null_prompt, self.get_learned_conditioning(xc["c_crossattn"]).detach())]
         cond["c_concat"] = [input_mask * self.encode_first_stage((xc["c_concat"].to(self.device))).mode().detach()]
+
+        # Add depth conditioning if enabled (generates depth on-the-fly)
+        if self.use_depth_conditioning and self.depth_conditioner is not None:
+            input_image = xc["c_concat"].to(self.device)
+            # Get depth map (3-channel, normalized to [-1, 1])
+            depth_3ch = self.depth_conditioner.get_depth(input_image)
+            if depth_3ch is not None:
+                # Ensure depth is on the correct device for VAE encoding
+                depth_3ch = depth_3ch.to(self.device)
+                # Encode depth through VAE to get latent
+                depth_latent = self.encode_first_stage(depth_3ch).mode().detach()
+                # Apply same dropout mask as input image
+                depth_latent = input_mask * depth_latent
+                # Append to c_concat (will be concatenated in DiffusionWrapper.forward)
+                cond["c_concat"].append(depth_latent)
 
         out = [z, cond]
         if return_first_stage_outputs:
@@ -1399,12 +1534,30 @@ class LatentDiffusion(DDPM):
         lr = self.learning_rate
 
         # Use only LoRA parameters if LoRA is enabled
-        if hasattr(self, 'lora_rank') and self.lora_rank > 0:
-            from lora_unet import get_lora_parameters
+        if self.lora_combiner is not None:
+            # New modular LoRA system
+            params = self.lora_combiner.get_all_trainable_params(self.model.diffusion_model)
+            stats = self.lora_combiner.count_all_parameters(self.model.diffusion_model)
+            print(f"[LoRA] Optimizer using {len(params)} params from modular LoRA ({stats['trainable']:,} total)")
+        elif hasattr(self, 'lora_rank') and self.lora_rank > 0:
+            # Legacy LoRA system
             params = get_lora_parameters(self.model.diffusion_model)
-            print(f"Optimizer using {len(params)} LoRA parameters only")
+            print(f"[LoRA] Optimizer using {len(params)} legacy LoRA parameters")
         else:
             params = list(self.model.parameters())
+
+        # Add depth conditioning input conv params if enabled
+        if self.use_depth_conditioning and self.depth_conditioner is not None:
+            unet = self.model.diffusion_model
+            if hasattr(unet, 'input_blocks'):
+                depth_conv = unet.input_blocks[0][0]
+            elif hasattr(unet, 'conv_in'):
+                depth_conv = unet.conv_in
+            else:
+                depth_conv = None
+            if depth_conv is not None:
+                params = list(params) + list(depth_conv.parameters())
+                print(f"[Depth] Added input conv params for depth conditioning")
 
         if self.cond_stage_trainable:
             print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
